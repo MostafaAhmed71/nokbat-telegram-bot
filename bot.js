@@ -1,0 +1,1280 @@
+const { Telegraf, session, Markup } = require('telegraf');
+const {
+  getTeacherByTelegramId,
+  searchStudentsByName,
+  getStudentById,
+} = require('./services/supabase');
+const {
+  registerAdmin,
+  isAdmin,
+  handleAdminText,
+  adminPanelKeyboard,
+  handleAdminDocument,
+  handleAdminPhoto,
+} = require('./handlers/admin');
+const {
+  teacherMainKeyboard,
+  handleTeacherText,
+  sendTeacherUploadList,
+} = require('./handlers/teacher');
+const {
+  formatStudentCommittee,
+  studentMainKeyboard,
+  aiSubjectsKeyboard,
+  quizSubjectsKeyboard,
+  quizAnswerKeyboard,
+  quizAfterKeyboard,
+  quizDifficultyKeyboard,
+  aiAfterAnswerKeyboard,
+  helpKeyboard,
+  gradesKeyboard,
+  settingsKeyboard,
+  studentPickKeyboard,
+} = require('./handlers/student');
+const { promptForNationalId, handleNationalIdText } = require('./handlers/results');
+const { askGemini, subjectLabel } = require('./services/gemini');
+const { ingestFile, searchLibrary } = require('./services/contentLibrary');
+const { inferExtFromMime } = require('./services/extractText');
+
+/** حد تنزيل الملفات عبر Bot API (تيليجرام لا يسمح للبوت بتنزيل ما يزيد عن ~20 ميجا) */
+const TELEGRAM_BOT_MAX_FILE_BYTES = 20 * 1024 * 1024;
+const {
+  getStudentByTelegramId,
+  setStudentTelegramIdByNationalId,
+  getStudentByNationalId,
+  getParentByTelegramId,
+  linkParentToStudent,
+} = require('./services/supabase');
+const { listExamsForGrade } = require('./services/supabase');
+const {
+  addChatHistory,
+  addFavorite,
+  listFavoritesForTelegramId,
+  deleteFavorite,
+} = require('./services/supabase');
+const fs = require('fs');
+const path = require('path');
+const { extractJsonObject } = require('./utils/jsonExtract');
+const { registerDiagnosticChallenge } = require('./handlers/diagnosticChallenge');
+
+function buildBot() {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    throw new Error('TELEGRAM_BOT_TOKEN غير معرّف في .env');
+  }
+
+  const bot = new Telegraf(token);
+  bot.use(
+    session({
+      defaultSession: () => ({
+        awaiting: null,
+        ai: {
+          subjectKey: null,
+          history: [],
+          lastAnswer: null,
+          style: 'medium',
+          lastSources: [],
+          lastQuestion: null,
+        },
+        student: {
+          gradeKey: null,
+        },
+        quiz: {
+          subjectKey: null,
+          points: 0,
+          difficulty: 'medium',
+          streak: 0,
+          lastDayKey: null,
+          badges: [],
+          current: null,
+        },
+        upload: null,
+        diagnostic: null,
+        dailyChallenge: null,
+      }),
+    })
+  );
+
+  registerAdmin(bot);
+  registerDiagnosticChallenge(bot);
+
+  /** تخزين مؤقت قصير لتقليل استدعاءات getTeacherByTelegramId على كل رسالة */
+  const TEACHER_CACHE_MS = 90000;
+  async function getTeacherCached(ctx) {
+    const uid = String(ctx.from?.id ?? '');
+    const now = Date.now();
+    const c = ctx.session._teacherCache;
+    if (c && c.userId === uid && now - c.at < TEACHER_CACHE_MS) {
+      return c.teacher;
+    }
+    const { data } = await getTeacherByTelegramId(ctx.from.id);
+    ctx.session._teacherCache = { userId: uid, at: now, teacher: data || null };
+    return data;
+  }
+
+  bot.command(['myid', 'معرف'], async (ctx) => {
+    const id = ctx.from.id;
+    return ctx.reply(
+      'معرّف تيليجرام لحسابك الحالي:\n' +
+        `${id}\n\n` +
+        'انسخ الرقم كما هو (أرقام فقط) وأرسله للإدارة ليُسجَّل في ملف المعلمين أو في Supabase في عمود telegram_id.\n\n' +
+        'تنبيه: رقم الجوال لا يُستخدم هنا — هذا المعرف يظهر فقط من داخل تيليجرام.'
+    );
+  });
+
+  bot.start(async (ctx) => {
+    if (isAdmin(ctx)) {
+      return ctx.reply(
+        'مرحباً بك في لوحة المدير.\n\nاستخدم /admin لفتح لوحة التحكم.'
+      );
+    }
+
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) {
+      ctx.session.awaiting = null;
+      return ctx.reply(
+        `مرحباً ${teacher.name}.\n\nاختر من القائمة:`,
+        teacherMainKeyboard()
+      );
+    }
+
+    // ولي الأمر (لو مرتبط مسبقاً)
+    try {
+      const { data: parent } = await getParentByTelegramId(ctx.from.id);
+      if (parent?.students?.name) {
+        ctx.session.awaiting = null;
+        return ctx.reply(
+          `مرحباً بك.\n\nتم ربطك بالطالب: ${parent.students.name}\nاختر من القائمة:`,
+          Markup.keyboard([
+            [Markup.button.text('📊 نتيجة ابني'), Markup.button.text('📋 لجنة ابني')],
+            [Markup.button.text('📅 جدول امتحانات ابني')],
+            [Markup.button.text('🏠 القائمة الرئيسية')],
+          ]).resize()
+        );
+      }
+    } catch {
+      // ignore
+    }
+
+    // الطالب (لو مرتبط مسبقاً)
+    try {
+      const { data: s } = await getStudentByTelegramId(ctx.from.id);
+      if (s?.name) {
+        ctx.session.awaiting = null;
+        return ctx.reply(
+          `مرحباً ${s.name}.\n\nاختر خدمة من القائمة:`,
+          studentMainKeyboard()
+        );
+      }
+    } catch {
+      // ignore
+    }
+
+    // تسجيل جديد
+    ctx.session.awaiting = 'pick_role';
+    return ctx.reply(
+      'مرحباً بك.\n\nاختر نوع حسابك للمتابعة:',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('👨‍🎓 أنا طالب', 'reg:role:student')],
+        [Markup.button.callback('👨‍👩‍👧 أنا ولي أمر', 'reg:role:parent')],
+      ])
+    );
+  });
+
+  function gradeKeyToLabel(gradeKey) {
+    const gradeMap = {
+      m1: 'أول متوسط',
+      m2: 'ثاني متوسط',
+      m3: 'ثالث متوسط',
+      s1: 'أول ثانوي',
+      s2: 'ثاني ثانوي',
+      s3: 'ثالث ثانوي',
+    };
+    return gradeMap[String(gradeKey || '')] || null;
+  }
+
+  function formatExams(rows) {
+    if (!rows.length) return 'لا يوجد جدول امتحانات مسجل حالياً.';
+    return rows
+      .map(
+        (r) =>
+          `• ${r.exam_date} — ${r.subject}${r.exam_time ? ` — ${r.exam_time}` : ''}`
+      )
+      .join('\n');
+  }
+
+  bot.hears('📅 جدول الامتحانات', async (ctx) => {
+    if (isAdmin(ctx)) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) return ctx.reply('هذا الخيار مخصص للطلاب.');
+
+    const grade = gradeKeyToLabel(ctx.session?.student?.gradeKey);
+    if (!grade) {
+      ctx.session.awaiting = 'student_pick_grade';
+      return ctx.reply('اختر صفّك الدراسي أولاً:', gradesKeyboard('grade:set'));
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const { data, error } = await listExamsForGrade(grade, today);
+    if (error) return ctx.reply('تعذر جلب جدول الامتحانات حالياً.');
+    return ctx.reply(`📅 جدول الامتحانات — ${grade}\n\n${formatExams(data || [])}`);
+  });
+
+  bot.hears('📅 جدول امتحانات ابني', async (ctx) => {
+    const { data: parent } = await getParentByTelegramId(ctx.from.id);
+    if (!parent?.students?.grade) {
+      return ctx.reply('لم يتم ربطك بولي أمر بعد. اكتب /start ثم اختر ولي أمر.');
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const { data, error } = await listExamsForGrade(parent.students.grade, today);
+    if (error) return ctx.reply('تعذر جلب جدول الامتحانات حالياً.');
+    return ctx.reply(
+      `📅 جدول امتحانات ${parent.students.name}\n\n${formatExams(data || [])}`
+    );
+  });
+
+  bot.action(/^reg:role:(student|parent)$/, async (ctx) => {
+    const role = ctx.match[1];
+    await ctx.answerCbQuery();
+    if (role === 'student') {
+      ctx.session.awaiting = 'reg_student_nid';
+      return ctx.reply('اكتب رقم الهوية/الإقامة للطالب للتسجيل.');
+    }
+    ctx.session.awaiting = 'reg_parent_child_nid';
+    return ctx.reply('اكتب رقم هوية/إقامة ابنك للربط كولي أمر.');
+  });
+
+  bot.hears(['🧾 لجنّتي', 'معرفة اللجنة'], async (ctx) => {
+    if (isAdmin(ctx)) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    ctx.session.awaiting = 'student_committee';
+    return ctx.reply('🧾 اكتب اسمك الكامل وسأعرض رقم ومكان لجنتك.', {
+      reply_markup: { remove_keyboard: true },
+    });
+  });
+
+  bot.hears(['🏁 نتيجتي', 'النتيجة'], async (ctx) => {
+    if (isAdmin(ctx)) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    return promptForNationalId(ctx);
+  });
+
+  bot.hears(['🤖 اسأل مساعد AI', 'اسأل AI 🤖'], async (ctx) => {
+    if (isAdmin(ctx)) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    ctx.session.student = ctx.session.student || {};
+    if (!ctx.session.student.gradeKey) {
+      ctx.session.awaiting = 'student_pick_grade';
+      return ctx.reply('اختر صفّك الدراسي أولاً:', gradesKeyboard('grade:set'));
+    }
+    ctx.session.awaiting = 'ai_pick_subject';
+    ctx.session.ai = ctx.session.ai || {};
+    ctx.session.ai.subjectKey = null;
+    ctx.session.ai.history = [];
+    ctx.session.ai.lastAnswer = null;
+    return ctx.reply('🤖 اختر المادة التي تريد السؤال عنها:', aiSubjectsKeyboard());
+  });
+
+  bot.hears('🧪 اختبار سريع', async (ctx) => {
+    if (isAdmin(ctx)) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    ctx.session.awaiting = null;
+    ctx.session.quiz = ctx.session.quiz || {};
+    ctx.session.quiz.subjectKey = null;
+    ctx.session.quiz.current = null;
+    ctx.session.quiz.points = Number(ctx.session.quiz.points || 0);
+    ctx.session.quiz.difficulty = ctx.session.quiz.difficulty || 'medium';
+    ctx.session.quiz.streak = Number(ctx.session.quiz.streak || 0);
+    ctx.session.quiz.lastDayKey = ctx.session.quiz.lastDayKey || null;
+    ctx.session.quiz.badges = Array.isArray(ctx.session.quiz.badges)
+      ? ctx.session.quiz.badges
+      : [];
+    return ctx.reply(
+      `🧪 اختبار سريع\n\nاختر مادة للاختبار:`,
+      quizSubjectsKeyboard()
+    );
+  });
+
+  bot.hears('ℹ️ المساعدة', async (ctx) => {
+    if (isAdmin(ctx)) {
+      return ctx.reply('استخدم /admin لفتح لوحة تحكم المدير.');
+    }
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) {
+      return ctx.reply(
+        'المساعدة:\n\n- 📅 جدولي اليوم: يعرض جدول حصصك.\n- 🔎 بحث طالب (لجنة): اكتب اسم الطالب لعرض بيانات لجنته.\n',
+        teacherMainKeyboard()
+      );
+    }
+    return ctx.reply(
+      'ℹ️ المساعدة — اختر ما تريد:',
+      helpKeyboard()
+    );
+  });
+
+  bot.hears('⚙️ الإعدادات', async (ctx) => {
+    if (isAdmin(ctx)) return ctx.reply('استخدم /admin لفتح لوحة تحكم المدير.');
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) return ctx.reply('الإعدادات متاحة للطلاب فقط حالياً.');
+    const style = ctx.session?.ai?.style || 'medium';
+    const gradeKey = ctx.session?.student?.gradeKey || null;
+    const gradeLine = gradeKey ? `\n\n✅ صفّك الحالي: ${gradeKey}` : '\n\nلم يتم تحديد الصف بعد.';
+    await ctx.reply('⚙️ الإعدادات — أسلوب الشرح:', settingsKeyboard(style));
+    return ctx.reply(`⚙️ الإعدادات — الصف الدراسي:${gradeLine}`, gradesKeyboard('grade:set'));
+  });
+
+  bot.hears('🏠 القائمة الرئيسية', async (ctx) => {
+    if (isAdmin(ctx)) {
+      return ctx.reply('استخدم /admin لفتح لوحة تحكم المدير.');
+    }
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) {
+      ctx.session.awaiting = null;
+      return ctx.reply('اختر من القائمة:', teacherMainKeyboard());
+    }
+    ctx.session.awaiting = null;
+    ctx.session.ai = ctx.session.ai || {};
+    ctx.session.ai.subjectKey = null;
+    ctx.session.ai.history = [];
+    ctx.session.ai.lastAnswer = null;
+    ctx.session.ai.lastSources = [];
+    ctx.session.ai.style = ctx.session.ai.style || 'medium';
+    ctx.session.quiz = ctx.session.quiz || {};
+    ctx.session.quiz.subjectKey = ctx.session.quiz.subjectKey || null;
+    ctx.session.quiz.points = Number(ctx.session.quiz.points || 0);
+    ctx.session.quiz.current = null;
+    ctx.session.diagnostic = null;
+    ctx.session.dailyChallenge = null;
+    return ctx.reply('اختر خدمة من القائمة:', studentMainKeyboard());
+  });
+
+  bot.command(['result', 'نتيجتي'], async (ctx) => {
+    if (isAdmin(ctx)) {
+      return ctx.reply('هذا الأمر مخصص للطلاب.');
+    }
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) {
+      return ctx.reply('هذا الأمر مخصص للطلاب.');
+    }
+    return promptForNationalId(ctx);
+  });
+
+  bot.on('text', async (ctx) => {
+    const txt = (ctx.message.text || '').trim();
+    if (txt.startsWith('/')) return;
+
+    const adminAwaiting =
+      isAdmin(ctx) &&
+      ctx.session.awaiting &&
+      String(ctx.session.awaiting).startsWith('admin_');
+    if (adminAwaiting) {
+      return handleAdminText(ctx);
+    }
+
+    if (isAdmin(ctx)) {
+      return ctx.reply('استخدم /admin لفتح لوحة تحكم المدير.');
+    }
+
+    const { data: teacher } = await getTeacherCached(ctx);
+    if (teacher) {
+      // تدفق رفع المراجعة للمعلم (لأن handleTeacherText له fallback عام)
+      if (txt === '📤 رفع مراجعة') {
+        ctx.session.upload = { kind: 'review', gradeKey: null, subjectKey: null };
+        ctx.session.awaiting = 'tch_upload_pick_grade';
+        return ctx.reply('اختر الصف لهذه المراجعة:', gradesKeyboard('tch:grade'));
+      }
+      if (txt === '📋 مراجعاتي المرفوعة') {
+        return sendTeacherUploadList(ctx);
+      }
+      return handleTeacherText(ctx, teacher);
+    }
+
+    if (ctx.session.awaiting === 'reg_student_nid') {
+      const { data: student, error } = await getStudentByNationalId(txt);
+      if (error) {
+        // eslint-disable-next-line no-console
+        console.error('reg_student_nid getStudentByNationalId', error);
+        return ctx.reply('تعذر التحقق حالياً. حاول لاحقاً.');
+      }
+      if (!student) return ctx.reply('لم يتم العثور على طالب بهذا الرقم. تأكد من الهوية.');
+      const { data: updated, error: upErr } = await setStudentTelegramIdByNationalId(
+        txt,
+        ctx.from.id
+      );
+      if (upErr || !updated) return ctx.reply('تعذر إتمام التسجيل. حاول لاحقاً.');
+      ctx.session.awaiting = null;
+      return ctx.reply(
+        `تم تسجيلك بنجاح يا ${updated.name}.\n\nاختر خدمة من القائمة:`,
+        studentMainKeyboard()
+      );
+    }
+
+    if (ctx.session.awaiting === 'reg_parent_child_nid') {
+      const { data: student, error } = await getStudentByNationalId(txt);
+      if (error) {
+        // eslint-disable-next-line no-console
+        console.error('reg_parent_child_nid getStudentByNationalId', error);
+        return ctx.reply('تعذر التحقق حالياً. حاول لاحقاً.');
+      }
+      if (!student) return ctx.reply('لم يتم العثور على طالب بهذا الرقم. تأكد من الهوية.');
+      const { data: link, error: lErr } = await linkParentToStudent({
+        parentTelegramId: ctx.from.id,
+        studentId: student.id,
+      });
+      if (lErr || !link) return ctx.reply('تعذر إتمام الربط. حاول لاحقاً.');
+      ctx.session.awaiting = null;
+      return ctx.reply(
+        `تم ربطك بولي أمر للطالب: ${student.name}\nاختر من القائمة:`,
+        Markup.keyboard([
+          [Markup.button.text('📊 نتيجة ابني'), Markup.button.text('📋 لجنة ابني')],
+          [Markup.button.text('📅 جدول امتحانات ابني')],
+          [Markup.button.text('🏠 القائمة الرئيسية')],
+        ]).resize()
+      );
+    }
+
+    if (ctx.session.awaiting === 'student_result') {
+      return handleNationalIdText(ctx, txt);
+    }
+
+    if (ctx.session.awaiting === 'student_pick_grade') {
+      return ctx.reply(
+        'اضغط زر الصف من الرسالة السابقة، أو افتح ⚙️ الإعدادات واختر الصف من هناك.',
+        gradesKeyboard('grade:set')
+      );
+    }
+
+    if (ctx.session.awaiting === 'ai_question') {
+      const subjectKey = ctx.session?.ai?.subjectKey || 'other';
+      const subjectName = subjectLabel(subjectKey);
+      const style = ctx.session?.ai?.style || 'medium';
+      const gradeKey = ctx.session?.student?.gradeKey;
+      // نبقي وضع الـ AI فعّال للأسئلة المتتابعة حتى يرجع المستخدم للقائمة
+      try {
+        await ctx.sendChatAction('typing').catch(() => {});
+        const history = Array.isArray(ctx.session?.ai?.history)
+          ? ctx.session.ai.history
+          : [];
+        const gradeMap = {
+          m1: 'أول متوسط',
+          m2: 'ثاني متوسط',
+          m3: 'ثالث متوسط',
+          s1: 'أول ثانوي',
+          s2: 'ثاني ثانوي',
+          s3: 'ثالث ثانوي',
+        };
+        const grade = gradeMap[String(gradeKey || '')] || null;
+        const retrievedChunks =
+          grade && subjectKey
+            ? await searchLibrary({
+                grade,
+                subjectKey,
+                query: txt,
+                topK: 4,
+              })
+            : [];
+        ctx.session.ai = ctx.session.ai || {};
+        ctx.session.ai.lastSources = Array.from(
+          new Set(
+            (retrievedChunks || [])
+              .map((r) => `${String(r.title || '').trim()}|${Number(r.chunk_order ?? 0)}`)
+              .filter((x) => !x.startsWith('|'))
+          )
+        )
+          .slice(0, 6)
+          .map((x) => {
+            const [title, order] = x.split('|');
+            return { title, chunk_order: Number(order || 0) };
+          });
+        const answer = await askGemini({
+          subjectKey,
+          question: txt,
+          history,
+          style,
+          retrievedChunks,
+        });
+        const safe =
+          answer ||
+          'لم أستطع توليد إجابة الآن. جرّب إعادة صياغة السؤال أو اسأل بطريقة أبسط.';
+        ctx.session.ai = ctx.session.ai || {};
+        ctx.session.ai.lastQuestion = txt;
+        ctx.session.ai.history = [...history, { q: txt, a: safe }].slice(-2);
+        ctx.session.ai.lastAnswer = safe;
+        ctx.session.awaiting = 'ai_question';
+        // حفظ سجل المحادثة
+        addChatHistory({
+          telegram_id: ctx.from.id,
+          question: txt,
+          answer: safe,
+          subject: subjectName,
+        }).catch(() => {});
+        await ctx.reply(
+          `المادة: ${subjectName}\n\n${safe}\n\nاكتب سؤالك التالي مباشرة 👇`,
+          aiAfterAnswerKeyboard()
+        );
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error('gemini error', e);
+        ctx.session.awaiting = 'ai_question';
+        const msg =
+          String(e?.message || '').includes('GEMINI_API_KEY')
+            ? 'خدمة الذكاء الاصطناعي غير مفعلة حالياً. (GEMINI_API_KEY غير مضبوط)'
+            : 'تعذر الاتصال بمساعد الذكاء الاصطناعي حالياً. حاول لاحقاً.';
+        await ctx.reply(msg, aiAfterAnswerKeyboard());
+      }
+      return undefined;
+    }
+
+    // بحث اللجنة فقط بعد الضغط على «لجنّتي» — يقلّل ضغط قاعدة البيانات والبطء الظاهر
+    if (ctx.session.awaiting !== 'student_committee') {
+      return ctx.reply(
+        'لم أفهم الرسالة.\n\n' +
+          '• للّجنة: اضغط «🧾 لجنّتي» ثم اكتب اسمك كما في السجل.\n' +
+          '• أو اختر خدمة من الأزرار في الأسفل.\n' +
+          '• ولي أمر: استخدم أزرار القائمة المخصصة لك.'
+      );
+    }
+
+    const { data, error } = await searchStudentsByName(txt);
+    if (error) {
+      return ctx.reply('تعذر البحث حالياً. حاول لاحقاً.');
+    }
+    if (!data.length) {
+      ctx.session.awaiting = 'student_committee';
+      return ctx.reply(
+        'لم يتم العثور على اسمك، تأكد من الاسم أو تواصل مع الإدارة.',
+        studentMainKeyboard()
+      );
+    }
+    if (data.length === 1) {
+      ctx.session.awaiting = null;
+      return ctx.reply(formatStudentCommittee(data[0]), studentMainKeyboard());
+    }
+    ctx.session.awaiting = null;
+    return ctx.reply(
+      'وجدنا أكثر من تطابق. اختر اسمك من القائمة:',
+      studentPickKeyboard(data)
+    );
+  });
+
+  bot.hears('⭐ مفضلتي', async (ctx) => {
+    if (isAdmin(ctx)) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (teacher) return ctx.reply('هذا الخيار مخصص للطلاب.');
+    const { data, error } = await listFavoritesForTelegramId(ctx.from.id, 15);
+    if (error) return ctx.reply('تعذر جلب المفضلة حالياً.');
+    if (!data.length) return ctx.reply('لا يوجد عناصر محفوظة في المفضلة حتى الآن.');
+
+    for (const fav of data) {
+      const subj = fav.subject ? `(${fav.subject})` : '';
+      // eslint-disable-next-line no-await-in-loop
+      await ctx.reply(
+        `⭐ ${subj}\n\n❓ ${fav.question}\n\n✅ ${fav.answer}`.slice(0, 3800),
+        Markup.inlineKeyboard([
+          [Markup.button.callback('🗑️ حذف', `fav:del:${fav.id}`)],
+        ])
+      );
+    }
+    return ctx.reply('انتهت القائمة.', studentMainKeyboard());
+  });
+
+  bot.action('fav:save', async (ctx) => {
+    await ctx.answerCbQuery();
+    const q = String(ctx.session?.ai?.lastQuestion || '').trim();
+    const a = String(ctx.session?.ai?.lastAnswer || '').trim();
+    const subjectKey = ctx.session?.ai?.subjectKey || 'other';
+    const subjectName = subjectLabel(subjectKey);
+    if (!q || !a) return ctx.reply('لا توجد إجابة سابقة لحفظها.');
+    const { error } = await addFavorite({
+      telegram_id: ctx.from.id,
+      question: q,
+      answer: a,
+      subject: subjectName,
+    });
+    if (error) return ctx.reply('تعذر الحفظ حالياً.');
+    return ctx.reply('✅ تم الحفظ في المفضلة.', aiAfterAnswerKeyboard());
+  });
+
+  bot.action(/^fav:del:([0-9a-f-]{36})$/i, async (ctx) => {
+    const id = ctx.match[1];
+    await ctx.answerCbQuery();
+    const { error } = await deleteFavorite({ telegramId: ctx.from.id, favoriteId: id });
+    if (error) return ctx.reply('تعذر الحذف حالياً.');
+    return ctx.reply('تم الحذف.');
+  });
+
+  bot.action(/^grade:set:(m1|m2|m3|s1|s2|s3)$/, async (ctx) => {
+    const g = ctx.match[1];
+    await ctx.answerCbQuery('تم');
+    ctx.session.student = ctx.session.student || {};
+    ctx.session.student.gradeKey = g;
+    if (ctx.session.awaiting === 'student_pick_grade') {
+      ctx.session.awaiting = 'ai_pick_subject';
+      return ctx.reply('✅ تم تحديد الصف. الآن اختر المادة:', aiSubjectsKeyboard());
+    }
+    return ctx.reply('✅ تم تحديث الصف.', studentMainKeyboard());
+  });
+
+  function getFilesRoot() {
+    return process.env.FILES_ROOT || path.join(__dirname, 'files');
+  }
+
+  function ensureDir(p) {
+    fs.mkdirSync(p, { recursive: true });
+  }
+
+  function sanitizeSegment(s) {
+    return String(s || '')
+      .trim()
+      .replace(/[\\/:*?"<>|]+/g, '_')
+      .replace(/\s+/g, ' ')
+      .slice(0, 80);
+  }
+
+  function gradeLabelFromKey(k) {
+    const map = {
+      m1: 'أول متوسط',
+      m2: 'ثاني متوسط',
+      m3: 'ثالث متوسط',
+      s1: 'أول ثانوي',
+      s2: 'ثاني ثانوي',
+      s3: 'ثالث ثانوي',
+    };
+    return map[String(k || '')] || null;
+  }
+
+  function teacherUploadSubjectsKeyboard() {
+    // نفس subject_key المستخدمة في AI
+    const rows = [
+      [
+        { t: '📐 رياضيات', k: 'math' },
+        { t: '🔬 علوم', k: 'science' },
+      ],
+      [
+        { t: '📖 لغتي', k: 'arabic' },
+        { t: '📚 إنجليزي', k: 'english' },
+      ],
+      [
+        { t: '🕌 إسلاميات', k: 'islamic' },
+        { t: '📜 اجتماعيات', k: 'social' },
+      ],
+      [
+        { t: 'فيزياء', k: 'physics' },
+        { t: 'كمياء', k: 'chemistry' },
+        { t: 'إحياء', k: 'biology' },
+      ],
+      [
+        { t: 'قدرات لفظي', k: 'qudrat_verbal' },
+        { t: 'قدرات كمي', k: 'qudrat_quant' },
+      ],
+      [{ t: 'التحصيلي', k: 'tahsili' }],
+      [{ t: '🎯 أخرى', k: 'other' }],
+    ].map((row) =>
+      row.map((x) => require('telegraf').Markup.button.callback(x.t, `tch:sub:${x.k}`))
+    );
+    rows.push([require('telegraf').Markup.button.callback('🏠 إلغاء', 'tch:cancel')]);
+    return require('telegraf').Markup.inlineKeyboard(rows);
+  }
+
+  bot.hears('📤 رفع مراجعة', async (ctx) => {
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (!teacher) return;
+    ctx.session.upload = { kind: 'review', gradeKey: null, subjectKey: null };
+    ctx.session.awaiting = 'tch_upload_pick_grade';
+    return ctx.reply('اختر الصف لهذه المراجعة:', gradesKeyboard('tch:grade'));
+  });
+
+  bot.hears('📋 مراجعاتي المرفوعة', async (ctx) => {
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (!teacher) return;
+    return sendTeacherUploadList(ctx);
+  });
+
+  bot.action(/^tch:grade:(m1|m2|m3|s1|s2|s3)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.upload = ctx.session.upload || { kind: 'review' };
+    ctx.session.upload.gradeKey = ctx.match[1];
+    ctx.session.awaiting = 'tch_upload_pick_subject';
+    return ctx.reply('اختر المادة:', teacherUploadSubjectsKeyboard());
+  });
+
+  bot.action(/^tch:sub:([a-z_]+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.upload = ctx.session.upload || { kind: 'review' };
+    ctx.session.upload.subjectKey = ctx.match[1];
+    ctx.session.awaiting = 'tch_upload_file';
+    return ctx.reply(
+      'أرسل ملف المراجعة الآن (PDF أو DOCX أو TXT).\n' +
+        '• الحد الأقصى للحجم: 20 ميجابايت (حد تيليجرام للبوتات).\n' +
+        '• ملف Word القديم (.doc): احفظ كـ DOCX أو PDF.'
+    );
+  });
+
+  bot.action('tch:cancel', async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.awaiting = null;
+    ctx.session.upload = null;
+    return ctx.reply('تم الإلغاء.', teacherMainKeyboard());
+  });
+
+  bot.on('document', async (ctx) => {
+    if (isAdmin(ctx)) {
+      const handled = await handleAdminDocument(ctx);
+      if (handled) return;
+    }
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    if (!teacher) return;
+    if (ctx.session.awaiting !== 'tch_upload_file') return;
+
+    const doc = ctx.message.document;
+    const fileId = doc.file_id;
+    const mime = doc.mime_type || '';
+    const name = doc.file_name || 'file';
+    let ext = String(path.extname(name) || '').toLowerCase();
+    if (!ext) ext = inferExtFromMime(mime);
+    if (!['.pdf', '.docx', '.txt', '.doc'].includes(ext)) {
+      return ctx.reply(
+        'صيغة غير مدعومة. أرسل PDF أو DOCX أو TXT (وليس Word القديم .doc إلا بعد تحويله).'
+      );
+    }
+
+    const sizeBytes = doc.file_size;
+    if (typeof sizeBytes === 'number' && sizeBytes > TELEGRAM_BOT_MAX_FILE_BYTES) {
+      const mb = (sizeBytes / (1024 * 1024)).toFixed(1);
+      return ctx.reply(
+        `الملف كبير جداً (${mb} ميجا). تيليجرام لا يسمح للبوت بتنزيل أكثر من 20 ميجا.\n` +
+          'جرّب: ضغط PDF، أو تقسيم الملف، أو رفعه من لوحة الويب إن وُجدت لذلك.'
+      );
+    }
+
+    const grade = gradeLabelFromKey(ctx.session?.upload?.gradeKey);
+    const subjectKey = String(ctx.session?.upload?.subjectKey || '').trim();
+    if (!grade || !subjectKey) {
+      return ctx.reply('ابدأ من جديد: 📤 رفع مراجعة ثم اختر الصف والمادة.');
+    }
+
+    const filesRoot = getFilesRoot();
+    const libDir = path.join(
+      filesRoot,
+      'library',
+      sanitizeSegment(grade),
+      sanitizeSegment(subjectKey)
+    );
+    ensureDir(libDir);
+    const base = sanitizeSegment(path.basename(name, ext) || 'review');
+    const outPath = path.join(libDir, `${base}-${Date.now()}${ext}`);
+
+    try {
+      const link = await ctx.telegram.getFileLink(fileId);
+      const res = await fetch(String(link));
+      if (!res.ok) throw new Error(`download failed: ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(outPath, buf);
+
+      const ing = await ingestFile({
+        kind: 'review',
+        grade,
+        subjectKey,
+        title: base,
+        filePath: outPath,
+        mime,
+        source: 'telegram',
+        uploadedByTelegramId: String(ctx.from.id),
+      });
+
+      ctx.session.awaiting = null;
+      ctx.session.upload = null;
+      const subName = subjectLabel(subjectKey);
+      return ctx.reply(
+        `تم رفع المراجعة وفهرستها بنجاح.\n\n` +
+          `العنوان: ${ing.title}\n` +
+          `الصف: ${grade}\n` +
+          `المادة: ${subName}\n` +
+          `عدد أجزاء الفهرسة: ${ing.chunksCount}\n\n` +
+          `للتحقق لاحقاً: «📋 مراجعاتي المرفوعة».`,
+        teacherMainKeyboard()
+      );
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('teacher upload error', e);
+      const raw =
+        typeof e?.message === 'string'
+          ? e.message
+          : String(e?.details || e?.hint || e || '');
+      if (raw === 'no_text_extracted' || raw.includes('no_text_extracted')) {
+        return ctx.reply(
+          'لم يُستخرج أي نص من الملف (مثلاً PDF صور فقط، أو ملف بدون نص).\n' +
+            'جرّب: تصدير PDF نصي، أو DOCX يحتوي نصاً حقيقياً وليس صوراً فقط.'
+        );
+      }
+      if (raw === 'doc_legacy_not_supported' || raw.includes('doc_legacy')) {
+        return ctx.reply(
+          'ملف Word القديم (.doc) لا يُستخرج منه النص هنا. احفظ الملف كـ «Word (.docx)» أو PDF ثم أعد الإرسال.'
+        );
+      }
+      if (raw.startsWith('word_extract_failed') || raw.includes('word_extract_failed')) {
+        return ctx.reply(
+          'تعذّر قراءة ملف Word (قد يكون تالفاً أو ليس DOCX صحيحاً). أعد الحفظ كـ DOCX أو أرسل PDF.'
+        );
+      }
+      if (raw.startsWith('unsupported file type')) {
+        return ctx.reply('صيغة الملف غير مدعومة داخلياً. أرسل PDF أو DOCX أو TXT.');
+      }
+      if (raw.includes('download failed')) {
+        return ctx.reply('تعذّر تنزيل الملف من تيليجرام. حاول مرة أخرى.');
+      }
+      if (raw.includes('file is too big')) {
+        return ctx.reply(
+          'الملف يتجاوز حد تيليجرام (20 ميجابايت للبوت). صغّر الملف أو قسّمه ثم أعد الإرسال.'
+        );
+      }
+      if (
+        raw.includes('relation') &&
+        raw.includes('does not exist')
+      ) {
+        return ctx.reply(
+          'خطأ في إعداد قاعدة البيانات (جداول المحتوى). تواصل مع المسؤول عن السيرفر.'
+        );
+      }
+      return ctx.reply(
+        'تعذر رفع/فهرسة الملف. إذا تكرر ذلك، راجع السجلات أو جرّب PDF/DOCX آخر.'
+      );
+    }
+  });
+
+  bot.on('photo', async (ctx) => {
+    if (isAdmin(ctx)) {
+      const handled = await handleAdminPhoto(ctx);
+      if (handled) return;
+    }
+  });
+
+  bot.action(/^pick:stu:([0-9a-f-]{36})$/i, async (ctx) => {
+    const id = ctx.match[1];
+    const { data, error } = await getStudentById(id);
+    await ctx.answerCbQuery();
+    if (error || !data) {
+      return ctx.reply('تعذر جلب بيانات الطالب.');
+    }
+
+    const { data: teacher } = await getTeacherByTelegramId(ctx.from.id);
+    const forStaff = Boolean(teacher) || isAdmin(ctx);
+    const msg = formatStudentCommittee(data, { forStaff });
+    if (teacher) {
+      return ctx.reply(msg, teacherMainKeyboard());
+    }
+    if (isAdmin(ctx)) {
+      return ctx.reply(msg, adminPanelKeyboard());
+    }
+    return ctx.reply(msg, studentMainKeyboard());
+  });
+
+  bot.action('ai:home', async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.awaiting = null;
+    ctx.session.ai = ctx.session.ai || {};
+    ctx.session.ai.subjectKey = null;
+    ctx.session.ai.history = [];
+    ctx.session.ai.lastAnswer = null;
+    ctx.session.ai.lastSources = [];
+    ctx.session.ai.style = ctx.session.ai.style || 'medium';
+    ctx.session.quiz = ctx.session.quiz || {};
+    ctx.session.quiz.current = null;
+    return ctx.reply('اختر من القائمة:', studentMainKeyboard());
+  });
+
+  bot.action('ai:change_subject', async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.awaiting = 'ai_pick_subject';
+    ctx.session.ai = ctx.session.ai || {};
+    ctx.session.ai.subjectKey = null;
+    ctx.session.ai.history = [];
+    ctx.session.ai.lastAnswer = null;
+    ctx.session.ai.lastSources = [];
+    ctx.session.ai.style = ctx.session.ai.style || 'medium';
+    return ctx.reply('📌 اختر مادة جديدة:', aiSubjectsKeyboard());
+  });
+
+  bot.action('ai:settings', async (ctx) => {
+    await ctx.answerCbQuery();
+    const style = ctx.session?.ai?.style || 'medium';
+    return ctx.reply('⚙️ اختر أسلوب الشرح:', settingsKeyboard(style));
+  });
+
+  bot.action('ai:clear', async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.ai = ctx.session.ai || {};
+    ctx.session.ai.history = [];
+    ctx.session.ai.lastAnswer = null;
+    ctx.session.ai.lastSources = [];
+    return ctx.reply('🗑️ تم مسح محادثة الـ AI. اكتب سؤالك الآن 👇', aiAfterAnswerKeyboard());
+  });
+
+  bot.action('ai:sources', async (ctx) => {
+    await ctx.answerCbQuery();
+    const sources = Array.isArray(ctx.session?.ai?.lastSources)
+      ? ctx.session.ai.lastSources
+      : [];
+    if (!sources.length) {
+      return ctx.reply('لا توجد مصادر مستخدمة في آخر إجابة (أو لم يتم العثور على محتوى مرتبط).');
+    }
+    const lines = sources.map(
+      (s, i) => `[#${i + 1}] ${s.title || 'مصدر'} (جزء ${Number(s.chunk_order || 0) + 1})`
+    );
+    return ctx.reply(`📎 المصادر المستخدمة:\n\n${lines.join('\n')}`, aiAfterAnswerKeyboard());
+  });
+
+  bot.action('ai:summarize', async (ctx) => {
+    await ctx.answerCbQuery();
+    const last = String(ctx.session?.ai?.lastAnswer || '').trim();
+    if (!last) return ctx.reply('لا توجد إجابة سابقة لتلخيصها.');
+    try {
+      const answer = await askGemini({
+        subjectKey: ctx.session?.ai?.subjectKey || 'other',
+        question: `لخّص الإجابة التالية في 3 نقاط قصيرة:\n\n${last}`,
+        history: [],
+        style: 'short',
+      });
+      return ctx.reply(`📝 ملخص:\n\n${answer}`, aiAfterAnswerKeyboard());
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('gemini summarize error', e);
+      return ctx.reply('تعذر تلخيص الإجابة حالياً.', aiAfterAnswerKeyboard());
+    }
+  });
+
+  bot.action('ai:simplify', async (ctx) => {
+    await ctx.answerCbQuery();
+    const last = String(ctx.session?.ai?.lastAnswer || '').trim();
+    if (!last) return ctx.reply('لا توجد إجابة سابقة لتبسيطها.');
+    try {
+      const answer = await askGemini({
+        subjectKey: ctx.session?.ai?.subjectKey || 'other',
+        question: `بسّط الشرح جداً لطالب متوسط مع مثال قصير:\n\n${last}`,
+        history: [],
+        style: 'short',
+      });
+      return ctx.reply(`🧠 شرح أبسط:\n\n${answer}`, aiAfterAnswerKeyboard());
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('gemini simplify error', e);
+      return ctx.reply('تعذر تبسيط الإجابة حالياً.', aiAfterAnswerKeyboard());
+    }
+  });
+
+  bot.action('ai:detail', async (ctx) => {
+    await ctx.answerCbQuery();
+    const last = String(ctx.session?.ai?.lastAnswer || '').trim();
+    if (!last) return ctx.reply('لا توجد إجابة سابقة لتفصيلها.');
+    try {
+      const answer = await askGemini({
+        subjectKey: ctx.session?.ai?.subjectKey || 'other',
+        question: `وسّع الشرح بالتفصيل مع خطوات مرتبة:\n\n${last}`,
+        history: [],
+        style: 'detailed',
+      });
+      return ctx.reply(`🧩 شرح بالتفصيل:\n\n${answer}`, aiAfterAnswerKeyboard());
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('gemini detail error', e);
+      return ctx.reply('تعذر تفصيل الإجابة حالياً.', aiAfterAnswerKeyboard());
+    }
+  });
+
+  bot.action('ai:again', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!ctx.session?.ai?.subjectKey) {
+      ctx.session.awaiting = 'ai_pick_subject';
+      return ctx.reply('اختر المادة التي تريد السؤال عنها:', aiSubjectsKeyboard());
+    }
+    ctx.session.awaiting = 'ai_question';
+    return ctx.reply('اكتب سؤالك وهرد عليك فوراً 👇', {
+      reply_markup: { remove_keyboard: true },
+    });
+  });
+
+  bot.action(/^ai:sub:([a-z_]+)$/, async (ctx) => {
+    const key = ctx.match[1];
+    ctx.session.ai = ctx.session.ai || {};
+    ctx.session.ai.subjectKey = key;
+    ctx.session.ai.history = ctx.session.ai.history || [];
+    ctx.session.ai.lastAnswer = ctx.session.ai.lastAnswer || null;
+    ctx.session.ai.style = ctx.session.ai.style || 'medium';
+    ctx.session.awaiting = 'ai_question';
+    await ctx.answerCbQuery();
+    return ctx.reply('✍️ اكتب سؤالك (وتقدر تتابع بأسئلة بعده):', {
+      reply_markup: { remove_keyboard: true },
+    });
+  });
+
+  bot.action(/^set:style:(short|medium|detailed)$/, async (ctx) => {
+    const style = ctx.match[1];
+    ctx.session.ai = ctx.session.ai || {};
+    ctx.session.ai.style = style;
+    await ctx.answerCbQuery('تم التحديث');
+    return ctx.reply(
+      `✅ تم ضبط أسلوب الشرح على: ${
+        style === 'short' ? 'مختصر' : style === 'detailed' ? 'مفصل' : 'متوسط'
+      }`,
+      settingsKeyboard(style)
+    );
+  });
+
+  bot.action('help:home', async (ctx) => {
+    await ctx.answerCbQuery();
+    return ctx.reply('اختر خدمة من القائمة:', studentMainKeyboard());
+  });
+
+  bot.action('help:ai', async (ctx) => {
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      '🤖 مساعد AI\n\n1) اضغط «🤖 اسأل مساعد AI»\n2) اختر المادة\n3) اكتب سؤالك\n\nنصيحة: اسأل سؤال متابعة مباشرة بدون ضغط أي زر.',
+      helpKeyboard()
+    );
+  });
+
+  bot.action('help:committee', async (ctx) => {
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      '🧾 لجنّتي\n\nاضغط «🧾 لجنّتي» ثم اكتب اسمك الكامل كما هو مسجل في المدرسة.',
+      helpKeyboard()
+    );
+  });
+
+  bot.action('help:result', async (ctx) => {
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      '🏁 نتيجتي\n\nاضغط «🏁 نتيجتي» ثم اكتب رقم الهوية/الإقامة.\nإذا لم تُرسل الصورة سيتم إرسال رابط النتيجة.',
+      helpKeyboard()
+    );
+  });
+
+  function dayKeyNow() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function dayKeyOffset(key, deltaDays) {
+    const [y, m, d] = String(key).split('-').map((x) => Number(x));
+    const dt = new Date(y, (m || 1) - 1, d || 1);
+    dt.setDate(dt.getDate() + Number(deltaDays || 0));
+    const yy = dt.getFullYear();
+    const mm = String(dt.getMonth() + 1).padStart(2, '0');
+    const dd = String(dt.getDate()).padStart(2, '0');
+    return `${yy}-${mm}-${dd}`;
+  }
+
+  function ensureQuizSession(ctx) {
+    ctx.session.quiz = ctx.session.quiz || {};
+    ctx.session.quiz.points = Number(ctx.session.quiz.points || 0);
+    ctx.session.quiz.difficulty = ctx.session.quiz.difficulty || 'medium';
+    ctx.session.quiz.streak = Number(ctx.session.quiz.streak || 0);
+    ctx.session.quiz.lastDayKey = ctx.session.quiz.lastDayKey || null;
+    ctx.session.quiz.badges = Array.isArray(ctx.session.quiz.badges)
+      ? ctx.session.quiz.badges
+      : [];
+    ctx.session.quiz.current = ctx.session.quiz.current || null;
+  }
+
+  function awardBadges(ctx) {
+    ensureQuizSession(ctx);
+    const b = new Set(ctx.session.quiz.badges);
+    const pts = Number(ctx.session.quiz.points || 0);
+    const streak = Number(ctx.session.quiz.streak || 0);
+
+    if (pts >= 5) b.add('🏅 مبتدئ (5 نقاط)');
+    if (pts >= 10) b.add('🥉 برونزي (10 نقاط)');
+    if (pts >= 20) b.add('🥈 فضي (20 نقطة)');
+    if (streak >= 3) b.add('🔥 سلسلة 3 أيام');
+    if (streak >= 7) b.add('💪 سلسلة 7 أيام');
+
+    ctx.session.quiz.badges = Array.from(b);
+  }
+
+  function difficultyLabel(d) {
+    if (d === 'easy') return 'سهل';
+    if (d === 'hard') return 'صعب';
+    return 'متوسط';
+  }
+
+  function difficultyHint(d) {
+    if (d === 'easy') return 'سهل: تعريفات مباشرة وأمثلة بسيطة.';
+    if (d === 'hard') return 'صعب: يحتاج تفكير وخطوة/خطوتين.';
+    return 'متوسط: مناسب للمراجعة اليومية.';
+  }
+
+  async function generateQuiz(ctx) {
+    ensureQuizSession(ctx);
+    await ctx.sendChatAction('typing').catch(() => {});
+    const subjectKey = ctx.session.quiz.subjectKey || 'other';
+    const subjectName = subjectLabel(subjectKey);
+    const difficulty = ctx.session.quiz.difficulty || 'medium';
+    const prompt = [
+      'اكتب سؤال اختيار من متعدد للطالب باللغة العربية.',
+      `المادة: ${subjectName}.`,
+      `الصعوبة: ${difficultyLabel(difficulty)} (${difficultyHint(difficulty)})`,
+      'المطلوب: JSON فقط بدون أي شرح أو نص إضافي.',
+      'الشكل المطلوب:',
+      '{"question":"...","options":["A","B","C","D"],"correctIndex":0,"explanation":"شرح مختصر"}',
+      'شروط:',
+      '- options عددها 4 بالضبط.',
+      '- correctIndex رقم من 0 إلى 3.',
+      '- explanation سطرين إلى 5 أسطر.',
+      '- لا تكتب أي شيء خارج JSON.',
+    ].join('\n');
+
+    const raw = await askGemini({
+      subjectKey,
+      question: prompt,
+      history: [],
+      style: 'short',
+    });
+
+    const obj = extractJsonObject(raw);
+    if (!obj) throw new Error('quiz_json_parse_failed');
+    const q = String(obj.question || '').trim();
+    const options = Array.isArray(obj.options) ? obj.options.map((x) => String(x)) : [];
+    const correctIndex = Number(obj.correctIndex);
+    const explanation = String(obj.explanation || '').trim();
+    if (!q || options.length !== 4 || !(correctIndex >= 0 && correctIndex <= 3)) {
+      throw new Error('quiz_invalid_payload');
+    }
+
+    ctx.session.quiz.current = { question: q, options, correctIndex, explanation };
+    const pts = Number(ctx.session.quiz.points || 0);
+    const streak = Number(ctx.session.quiz.streak || 0);
+    const badgeCount = Array.isArray(ctx.session.quiz.badges)
+      ? ctx.session.quiz.badges.length
+      : 0;
+    return ctx.reply(
+      `🧪 اختبار سريع — ${subjectName}\nالصعوبة: ${difficultyLabel(difficulty)}\n\n${q}\n\n🏅 نقاطك: ${pts} | 🔥 السلسلة: ${streak} | 🎖️ الشارات: ${badgeCount}`,
+      quizAnswerKeyboard(options)
+    );
+  }
+
+  bot.action('quiz:home', async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.quiz = ctx.session.quiz || {};
+    ctx.session.quiz.current = null;
+    ctx.session.quiz.subjectKey = null;
+    return ctx.reply('اختر خدمة من القائمة:', studentMainKeyboard());
+  });
+
+  bot.action('quiz:change_subject', async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.quiz = ctx.session.quiz || {};
+    ctx.session.quiz.subjectKey = null;
+    ctx.session.quiz.current = null;
+    return ctx.reply('📌 اختر مادة للاختبار:', quizSubjectsKeyboard());
+  });
+
+  bot.action('quiz:settings', async (ctx) => {
+    await ctx.answerCbQuery();
+    ensureQuizSession(ctx);
+    return ctx.reply(
+      `⚙️ إعدادات الاختبار\n\nاختر الصعوبة الحالية: ${difficultyLabel(
+        ctx.session.quiz.difficulty
+      )}`,
+      quizDifficultyKeyboard(ctx.session.quiz.difficulty)
+    );
+  });
+
+  bot.action(/^quiz:diff:(easy|medium|hard)$/, async (ctx) => {
+    const d = ctx.match[1];
+    await ctx.answerCbQuery('تم');
+    ensureQuizSession(ctx);
+    ctx.session.quiz.difficulty = d;
+    return ctx.reply(
+      `✅ تم ضبط الصعوبة على: ${difficultyLabel(d)}\n\nاضغط «🔁 سؤال جديد» لبدء سؤال بهذه الصعوبة.`,
+      quizAfterKeyboard()
+    );
+  });
+
+  bot.action('quiz:next', async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.session.quiz = ctx.session.quiz || {};
+    if (!ctx.session.quiz.subjectKey) {
+      return ctx.reply('اختر مادة للاختبار:', quizSubjectsKeyboard());
+    }
+    try {
+      return await generateQuiz(ctx);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('quiz gen error', e);
+      return ctx.reply('تعذر توليد سؤال الآن. حاول مرة أخرى.', quizAfterKeyboard());
+    }
+  });
+
+  bot.action(/^quiz:sub:([a-z_]+)$/, async (ctx) => {
+    const key = ctx.match[1];
+    await ctx.answerCbQuery();
+    ctx.session.quiz = ctx.session.quiz || {};
+    ctx.session.quiz.subjectKey = key;
+    ctx.session.quiz.points = Number(ctx.session.quiz.points || 0);
+    ctx.session.quiz.current = null;
+    try {
+      return await generateQuiz(ctx);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('quiz gen error', e);
+      return ctx.reply('تعذر توليد سؤال الآن. حاول مرة أخرى.', quizAfterKeyboard());
+    }
+  });
+
+  bot.action(/^quiz:ans:(\d)$/, async (ctx) => {
+    const pick = Number(ctx.match[1]);
+    await ctx.answerCbQuery();
+    const cur = ctx.session?.quiz?.current;
+    if (!cur) {
+      return ctx.reply('لا يوجد سؤال نشط. اضغط «🧪 اختبار سريع» للبدء.');
+    }
+    const correct = Number(cur.correctIndex);
+    const ok = pick === correct;
+    ensureQuizSession(ctx);
+    ctx.session.quiz.points = Number(ctx.session.quiz.points || 0) + (ok ? 1 : 0);
+
+    // تحديث السلسلة مرة واحدة لكل يوم عند حل أول سؤال
+    const today = dayKeyNow();
+    const last = ctx.session.quiz.lastDayKey;
+    if (last !== today) {
+      if (last && dayKeyOffset(last, 1) === today) {
+        ctx.session.quiz.streak = Number(ctx.session.quiz.streak || 0) + 1;
+      } else {
+        ctx.session.quiz.streak = 1;
+      }
+      ctx.session.quiz.lastDayKey = today;
+    }
+    awardBadges(ctx);
+
+    const chosen = cur.options?.[pick] ?? '';
+    const right = cur.options?.[correct] ?? '';
+    const header = ok ? '✅ إجابة صحيحة!' : '❌ إجابة غير صحيحة';
+    const explain = cur.explanation ? `\n\n📌 الشرح:\n${cur.explanation}` : '';
+    ctx.session.quiz.current = null;
+    const badges = Array.isArray(ctx.session.quiz.badges) ? ctx.session.quiz.badges : [];
+    const badgesLine = badges.length ? `\n🎖️ شاراتك: ${badges.slice(-3).join(' — ')}` : '';
+    return ctx.reply(
+      `${header}\n\nاختيارك: ${chosen}\nالإجابة الصحيحة: ${right}\n\n🏅 نقاطك: ${ctx.session.quiz.points} | 🔥 السلسلة: ${ctx.session.quiz.streak}${badgesLine}${explain}`,
+      quizAfterKeyboard()
+    );
+  });
+
+  bot.catch((err, ctx) => {
+    // eslint-disable-next-line no-console
+    console.error('bot error', err);
+    if (ctx?.reply) {
+      return ctx.reply('حدث خطأ غير متوقع.');
+    }
+    return undefined;
+  });
+
+  return bot;
+}
+
+module.exports = { buildBot };
